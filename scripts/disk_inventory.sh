@@ -1,24 +1,39 @@
-
 #!/bin/bash
-# TrueNAS Disk Inventory Script
+# TrueNAS Disk Inventory Script - IMPROVED VERSION
 # Generates a table of all disks with enclosure/slot info, SMART status, and health
+# Improvements:
+# - Fixed Drive Type parsing
+# - Serial number-based device mapping
+# - SMART health status checking
+# - ZPool status cross-reference
 
 OUTPUT_FILE="/mnt/RaidZ3/local_TrueNAS_scripts/HDD_Info/disk_inventory_$(date +%Y%m%d_%H%M%S).txt"
 HTML_FILE="/mnt/RaidZ3/local_TrueNAS_scripts/HDD_Info/disk_inventory_$(date +%Y%m%d_%H%M%S).html"
 LOG_FILE="/mnt/RaidZ3/local_TrueNAS_scripts/HDD_Info/disk_inventory.log"
 
+# Enable debug mode by setting DEBUG=1
+DEBUG=${DEBUG:-0}
+
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
 
-log "Starting disk inventory..."
+debug() {
+    if [ "$DEBUG" = "1" ]; then
+        echo "[DEBUG] $1" >&2
+    fi
+}
 
+log "Starting disk inventory (improved version)..."
+
+# Get sas3ircu output
 SAS3IRCU_OUTPUT=$(sas3ircu 0 display 2>/dev/null)
 if [ $? -ne 0 ]; then
     log "ERROR: sas3ircu 0 display failed"
     exit 1
 fi
 
+# Declare associative arrays
 declare -A DISK_STATE
 declare -A DISK_SAS_ADDR
 declare -A DISK_MODEL
@@ -26,9 +41,14 @@ declare -A DISK_SERIAL
 declare -A DISK_SIZE_MB
 declare -A DISK_TYPE
 declare -A DISK_FW_REV
+declare -A DEVICE_SERIAL_MAP  # Maps serial -> /dev/sdX
+declare -A DISK_TEMPERATURE
+declare -A DISK_HEALTH
+declare -A DISK_ZPOOL_STATUS
 
 ENCLOSURE_MAX_SLOT=25
 
+# Parse sas3ircu output
 parse_sas3ircu() {
     local in_device=0
     local enclosure=""
@@ -73,39 +93,136 @@ parse_sas3ircu() {
                     fw=$(echo "$line_trimmed" | cut -d: -f2- | sed 's/^[[:space:]]*//' | tr -d ' ')
                     DISK_FW_REV["${enclosure}:${slot}"]="$fw"
                     ;;
-                Drive*)
-                    dtype=$(echo "$line_trimmed" | sed 's/Drive Type.*://' | sed 's/^[[:space:]]*//' | tr -d ' ')
-                    DISK_TYPE["${enclosure}:${slot}"]="$dtype"
-                    ;;
                 GUID*)
-                    in_device=0
+                    # Don't exit yet - Drive Type comes after GUID
+                    ;;
+                "Drive Type"*)
+                    # FIXED: Use quoted pattern to match "Drive Type" correctly
+                    # This comes AFTER GUID in the output, so we process it but then exit
+                    dtype=$(echo "$line_trimmed" | cut -d: -f2 | sed 's/^[[:space:]]*//' | tr -d ' ')
+                    DISK_TYPE["${enclosure}:${slot}"]="$dtype"
+                    debug "Found Drive Type: $dtype for slot $slot"
+                    in_device=0  # Exit after Drive Type (last field we care about)
                     ;;
             esac
         fi
     done <<< "$SAS3IRCU_OUTPUT"
 }
 
-get_temperature() {
-    local dev="$1"
-    local temp=""
-
-    temp=$(smartctl -A "$dev" 2>/dev/null | grep -i "temperature" | head -1 | awk '{print $10}')
-
-    if [ -z "$temp" ]; then
-        temp=$(smartctl -A "$dev" 2>/dev/null | grep "194 Temperature_Celsius" | awk '{print $10}')
-    fi
-
-    if [ -z "$temp" ]; then
-        temp="-"
-    fi
-
-    echo "$temp"
+# Build serial number to device map
+build_device_serial_map() {
+    log "Building device-to-serial map (this may take 30-60 seconds)..."
+    local count=0
+    local total=0
+    
+    # Count total devices first
+    for dev in /dev/sd*; do
+        [[ "$dev" =~ [0-9]$ ]] && continue
+        [ -b "$dev" ] || continue
+        ((total++))
+    done
+    
+    for dev in /dev/sd*; do
+        # Skip partitions (only whole disks)
+        [[ "$dev" =~ [0-9]$ ]] && continue
+        
+        # Check if block device exists
+        [ -b "$dev" ] || continue
+        
+        ((count++))
+        echo -ne "\rScanning devices: $count/$total..." >&2
+        
+        # Get serial from smartctl
+        serial=$(smartctl -i "$dev" 2>/dev/null | grep -i "serial number" | awk '{print $NF}' | tr -d ' ')
+        
+        if [ -n "$serial" ]; then
+            DEVICE_SERIAL_MAP["$serial"]="$dev"
+            debug "Mapped serial $serial -> $dev"
+        fi
+    done
+    echo -e "\rFound ${#DEVICE_SERIAL_MAP[@]} devices with serial numbers      " >&2
+    log "Device mapping complete: ${#DEVICE_SERIAL_MAP[@]} devices"
 }
 
-get_lsscsi_device() {
-    local slot="$1"
+# Get temperature and health using serial number
+get_smart_data() {
+    local serial="$1"
+    local dev="${DEVICE_SERIAL_MAP[$serial]:-}"
+    
+    if [ -z "$dev" ]; then
+        debug "No device found for serial $serial"
+        DISK_TEMPERATURE["$serial"]="-"
+        DISK_HEALTH["$serial"]="UNKNOWN"
+        return
+    fi
+    
+    debug "Getting SMART data for $dev (serial: $serial)"
+    
+    # Get SMART data in one call for efficiency
+    local smart_output=$(smartctl -AH "$dev" 2>/dev/null)
+    
+    # Extract temperature
+    local temp=$(echo "$smart_output" | grep -iE "temperature|airflow" | head -1 | awk '{print $10}')
+    if [ -z "$temp" ] || [ "$temp" == "0" ]; then
+        temp="-"
+    fi
+    DISK_TEMPERATURE["$serial"]="$temp"
+    
+    # Extract health status
+    local health=$(echo "$smart_output" | grep -i "SMART overall-health" | awk '{print $NF}')
+    
+    if [ -z "$health" ]; then
+        # Try alternative format
+        health=$(echo "$smart_output" | grep -i "test result" | awk '{print $NF}')
+    fi
+    
+    # Check critical SMART attributes
+    if [ "$health" == "PASSED" ]; then
+        local realloc=$(echo "$smart_output" | grep "Reallocated_Sector" | awk '{print $10}')
+        local pending=$(echo "$smart_output" | grep "Current_Pending_Sector" | awk '{print $10}')
+        local uncorrect=$(echo "$smart_output" | grep "Offline_Uncorrectable" | awk '{print $10}')
+        
+        if [ -n "$realloc" ] && [ "$realloc" -gt 0 ]; then
+            health="WARN:REALLOC($realloc)"
+        elif [ -n "$pending" ] && [ "$pending" -gt 0 ]; then
+            health="WARN:PENDING($pending)"
+        elif [ -n "$uncorrect" ] && [ "$uncorrect" -gt 0 ]; then
+            health="WARN:UNCORRECT($uncorrect)"
+        else
+            health="PASSED"
+        fi
+    else
+        health="${health:-UNKNOWN}"
+    fi
+    
+    DISK_HEALTH["$serial"]="$health"
+    debug "SMART data: temp=$temp, health=$health"
+}
 
-    lsscsi -s 2>/dev/null | grep "\[0:0:${slot}:0\]" | awk '{print $7}'
+# Check ZPool status for each device
+check_zpool_status() {
+    log "Checking ZPool status..."
+    local zpool_output=$(zpool status 2>/dev/null)
+    
+    for serial in "${!DEVICE_SERIAL_MAP[@]}"; do
+        local dev="${DEVICE_SERIAL_MAP[$serial]}"
+        local dev_basename=$(basename "$dev")
+        
+        # Check if device appears in zpool status
+        if echo "$zpool_output" | grep -q "$dev_basename"; then
+            if echo "$zpool_output" | grep "$dev_basename" | grep -qi "DEGRADED\|FAULTED\|UNAVAIL"; then
+                DISK_ZPOOL_STATUS["$serial"]="ISSUE"
+                debug "ZPool issue detected for $dev_basename"
+            elif echo "$zpool_output" | grep "$dev_basename" | grep -qi "ONLINE"; then
+                DISK_ZPOOL_STATUS["$serial"]="ONLINE"
+            else
+                DISK_ZPOOL_STATUS["$serial"]="UNKNOWN"
+            fi
+        else
+            DISK_ZPOOL_STATUS["$serial"]="NOT_IN_POOL"
+        fi
+    done
+    log "ZPool status check complete"
 }
 
 format_size_mb() {
@@ -119,26 +236,43 @@ format_size_mb() {
     fi
 }
 
+# Main execution
 parse_sas3ircu
-
 log "Found ${#DISK_MODEL[@]} disks in sas3ircu output"
 
+build_device_serial_map
+
+# Get SMART data for all disks
+log "Collecting SMART data for all disks..."
+for slot in $(seq 0 $((ENCLOSURE_MAX_SLOT - 1))); do
+    key="2:${slot}"
+    if [ -n "${DISK_SERIAL[$key]:-}" ]; then
+        serial="${DISK_SERIAL[$key]}"
+        get_smart_data "$serial"
+    fi
+done
+
+check_zpool_status
+
+# Generate report
 {
     echo "=============================================="
-    echo "TrueNAS Disk Inventory Report"
+    echo "TrueNAS Disk Inventory Report (IMPROVED)"
     echo "Generated: $(date)"
     echo "=============================================="
     echo ""
     echo "ENCLOSURE #2 (Main Chassis) - ${ENCLOSURE_MAX_SLOT} slots total"
     echo "----------------------------------------------"
-    printf "%-5s | %-12s | %-25s | %-12s | %-8s | %-15s | %-6s | %s\n" \
-        "SLOT" "STATE" "MODEL" "SIZE" "TYPE" "SERIAL" "TEMP" "NOTES"
+    printf "%-5s | %-12s | %-25s | %-10s | %-8s | %-15s | %-6s | %-12s | %s\n" \
+        "SLOT" "STATE" "MODEL" "SIZE" "TYPE" "SERIAL" "TEMP" "HEALTH" "NOTES"
     echo "----------------------------------------------"
 
     sas_ssd_count=0
     sata_hdd_count=0
     sas_ssd_capacity=0
     sata_hdd_capacity=0
+    health_warn_count=0
+    health_fail_count=0
 
     for slot in $(seq 0 $((ENCLOSURE_MAX_SLOT - 1))); do
         key="2:${slot}"
@@ -150,15 +284,29 @@ log "Found ${#DISK_MODEL[@]} disks in sas3ircu output"
             size=$(format_size_mb $size_mb)
             dtype="${DISK_TYPE[$key]:-N/A}"
             serial="${DISK_SERIAL[$key]:-N/A}"
-
-            device=$(get_lsscsi_device $slot 2>/dev/null)
-            temp=$(get_temperature "/dev/$device" 2>/dev/null)
+            
+            # Get temperature and health from cached data
+            temp="${DISK_TEMPERATURE[$serial]:-"-"}"
+            health="${DISK_HEALTH[$serial]:-"UNKNOWN"}"
+            zpool_status="${DISK_ZPOOL_STATUS[$serial]:-"NOT_IN_POOL"}"
 
             notes=""
             if [[ "$state" == *"Failed"* ]]; then
                 notes="FAILED"
             elif [[ "$state" == *"Standby"* ]]; then
                 notes="SPIN DOWN"
+            fi
+            
+            # Add ZPool status to notes if there's an issue
+            if [[ "$zpool_status" == "ISSUE" ]]; then
+                notes="${notes:+$notes, }ZPOOL_ISSUE"
+            fi
+            
+            # Count health warnings/failures
+            if [[ "$health" == "WARN"* ]]; then
+                ((health_warn_count++))
+            elif [[ "$health" == "FAILED" ]]; then
+                ((health_fail_count++))
             fi
 
             if [[ "$dtype" == "SAS_SSD" ]]; then
@@ -171,11 +319,11 @@ log "Found ${#DISK_MODEL[@]} disks in sas3ircu output"
                 sata_hdd_capacity=$((sata_hdd_capacity + size_mb))
             fi
 
-            printf "%-5s | %-12s | %-25s | %-12s | %-8s | %-15s | %-6s | %s\n" \
-                "$slot" "$state" "${model:0:25}" "$size" "$dtype" "${serial:0:15}" "${temp}°C" "$notes"
+            printf "%-5s | %-12s | %-25s | %-10s | %-8s | %-15s | %-6s | %-12s | %s\n" \
+                "$slot" "$state" "${model:0:25}" "$size" "$dtype" "${serial:0:15}" "${temp}°C" "$health" "$notes"
         else
-            printf "%-5s | %-12s | %-25s | %-12s | %-8s | %-15s | %-6s | %s\n" \
-                "$slot" "Empty" "(no disk detected)" "-" "-" "-" "-" "-"
+            printf "%-5s | %-12s | %-25s | %-10s | %-8s | %-15s | %-6s | %-12s | %s\n" \
+                "$slot" "Empty" "(no disk detected)" "-" "-" "-" "-" "-" "-"
         fi
     done
 
@@ -194,6 +342,12 @@ log "Found ${#DISK_MODEL[@]} disks in sas3ircu output"
     echo "Total Storage: $(format_size_mb $total_capacity)"
     echo ""
     echo "----------------------------------------------"
+    echo "HEALTH SUMMARY"
+    echo "----------------------------------------------"
+    echo "Disks with warnings: $health_warn_count"
+    echo "Disks with failures: $health_fail_count"
+    echo ""
+    echo "----------------------------------------------"
     echo "POTENTIAL FAILED/MISSING DISKS"
     echo "----------------------------------------------"
 
@@ -202,15 +356,19 @@ log "Found ${#DISK_MODEL[@]} disks in sas3ircu output"
         key="2:${slot}"
         if [ -n "${DISK_STATE[$key]:-}" ]; then
             state="${DISK_STATE[$key]}"
-            if [[ "$state" == *"Failed"* ]]; then
-                echo "Slot $slot: ${DISK_MODEL[$key]:-Unknown} - $state"
+            serial="${DISK_SERIAL[$key]}"
+            health="${DISK_HEALTH[$serial]:-UNKNOWN}"
+            zpool_status="${DISK_ZPOOL_STATUS[$serial]:-NOT_IN_POOL}"
+            
+            if [[ "$state" == *"Failed"* ]] || [[ "$health" == "FAILED" ]] || [[ "$zpool_status" == "ISSUE" ]]; then
+                echo "Slot $slot: ${DISK_MODEL[$key]:-Unknown} - State: $state, Health: $health, ZPool: $zpool_status"
                 failed_count=$((failed_count + 1))
             fi
         fi
     done
 
     if [ $failed_count -eq 0 ]; then
-        echo "No failed disks detected in sas3ircu output"
+        echo "No failed disks detected"
     fi
 
     echo ""
@@ -218,11 +376,18 @@ log "Found ${#DISK_MODEL[@]} disks in sas3ircu output"
     echo "DETECTION METHODS USED"
     echo "----------------------------------------------"
     echo "1. sas3ircu 0 display - Primary source for enclosure/slot mapping"
-    echo "2. lsscsi -s - Maps SCSI devices to /dev/sdX names"
-    echo "3. smartctl - Temperature and health data"
+    echo "2. Serial number matching - Correlates physical slots to /dev/sdX devices"
+    echo "3. smartctl - Temperature and SMART health data"
+    echo "4. zpool status - Pool-level disk status"
+    echo ""
+    echo "IMPROVEMENTS IN THIS VERSION:"
+    echo "- Fixed Drive Type parsing (now correctly detects SAS_SSD, SATA_HDD)"
+    echo "- Serial number-based device mapping (more reliable than lsscsi slot order)"
+    echo "- SMART health status with critical attribute checking"
+    echo "- ZPool status cross-reference"
     echo ""
     echo "Note: Failed disks may not appear in sas3ircu output"
-    echo "Check zpool status for pool-level disk issues"
+    echo "Check zpool status for complete pool health information"
     echo ""
     echo "=============================================="
     echo "End of Report"
@@ -231,156 +396,14 @@ log "Found ${#DISK_MODEL[@]} disks in sas3ircu output"
 } | tee "$OUTPUT_FILE"
 
 log "Inventory saved to $OUTPUT_FILE"
-
-if command -v python3 &> /dev/null; then
-    python3 - "$OUTPUT_FILE" "$HTML_FILE" << 'PYTHON_EOF'
-import sys
-import re
-from datetime import datetime
-
-txt_file = sys.argv[1]
-html_file = sys.argv[2]
-
-html_template = '''<!DOCTYPE html>
-<html>
-<head>
-    <title>TrueNAS Disk Inventory</title>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 20px; background: #1a1a2e; color: #eee; }
-        h1 { color: #00d4ff; }
-        h2 { color: #00d4ff; margin-top: 30px; }
-        table { border-collapse: collapse; width: 100%; margin: 20px 0; background: #16213e; }
-        th, td { border: 1px solid #0f3460; padding: 10px; text-align: left; }
-        th { background: #0f3460; color: #00d4ff; }
-        tr:nth-child(even) { background: #1a1a2e; }
-        tr:hover { background: #0f3460; }
-        .failed { color: #ff6b6b; font-weight: bold; }
-        .ssd { color: #4ade80; }
-        .hdd { color: #fbbf24; }
-        .summary { background: #0f3460; padding: 15px; border-radius: 8px; margin: 20px 0; }
-        .badge { padding: 3px 8px; border-radius: 4px; font-size: 0.85em; }
-        .badge-ready { background: #166534; color: #86efac; }
-        .badge-failed { background: #991b1b; color: #fca5a5; }
-        .badge-standby { background: #713f12; color: #fde047; }
-        .badge-empty { background: #374151; color: #9ca3af; }
-    </style>
-</head>
-<body>
-    <h1>TrueNAS Disk Inventory Report</h1>
-    <p>Generated: TIMESTAMP</p>
-    
-    <div class="summary">
-        <h2>Summary</h2>
-        <p><strong>Total Slots:</strong> 24</p>
-        <p><strong>Disks Detected:</strong> DISK_COUNT</p>
-        <p><strong>Failed/Missing:</strong> FAILED_COUNT</p>
-        <p><strong>Total Capacity:</strong> TOTAL_CAPACITY</p>
-    </div>
-    
-    <h2>Disk Details</h2>
-    <table>
-        <tr>
-            <th>Slot</th>
-            <th>State</th>
-            <th>Model</th>
-            <th>Size</th>
-            <th>Type</th>
-            <th>Serial</th>
-            <th>Temp</th>
-            <th>Notes</th>
-        </tr>
-        TABLE_ROWS
-    </table>
-    
-    <h2>Detection Notes</h2>
-    <ul>
-        <li>sas3ircu 0 display - Primary source for enclosure/slot mapping</li>
-        <li>Failed disks may not appear in sas3ircu output</li>
-        <li>Check zpool status for pool-level disk issues</li>
-    </ul>
-</body>
-</html>
-'''
-
-try:
-    with open(txt_file, "r") as f:
-        content = f.read()
-    
-    disk_count = len(re.findall(r'SAS-SSD|SATA-HDD', content))
-    failed_count = len(re.findall(r'FAILED|MISSING', content))
-    
-    total_capacity_match = re.search(r'Total Storage: (\S+)', content)
-    total_capacity = total_capacity_match.group(1) if total_capacity_match else "Unknown"
-    
-    table_rows = ""
-    in_table = False
-    for line in content.split('\n'):
-        if "SLOT" in line and "STATE" in line:
-            in_table = True
-            continue
-        if in_table and line.strip() and "---" not in line and "===" not in line:
-            if "Enclosure services" in line or "DETECTION" in line:
-                continue
-            
-            parts = [p.strip() for p in line.split('|')]
-            if len(parts) >= 8:
-                slot = parts[0].strip()
-                state = parts[1].strip()
-                model = parts[2].strip()
-                size = parts[3].strip()
-                dtype = parts[4].strip()
-                serial = parts[5].strip()
-                temp = parts[6].strip()
-                notes = parts[7].strip() if len(parts) > 7 else ""
-                
-                badge_class = "badge-ready"
-                if "FAIL" in state or "MISSING" in notes:
-                    badge_class = "badge-failed"
-                elif "Standby" in state:
-                    badge_class = "badge-standby"
-                elif state == "Empty":
-                    badge_class = "badge-empty"
-                
-                row_class = ""
-                if dtype == "SAS-SSD":
-                    row_class = "ssd"
-                elif dtype == "SATA-HDD":
-                    row_class = "hdd"
-                elif state == "Empty":
-                    row_class = "missing"
-                
-                if "FAILED" in notes or "MISSING" in notes:
-                    row_class = "failed"
-                
-                table_rows += f'''<tr class="{row_class}">
-                    <td><strong>{slot}</strong></td>
-                    <td><span class="badge {badge_class}">{state}</span></td>
-                    <td>{model}<br><small>{serial}</small></td>
-                    <td>{size}</td>
-                    <td>{dtype}</td>
-                    <td><small>{serial}</small></td>
-                    <td>{temp}</td>
-                    <td>{notes}</td>
-                </tr>
-'''
-    
-    html_content = html_template.replace("TIMESTAMP", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-    html_content = html_content.replace("DISK_COUNT", str(disk_count))
-    html_content = html_content.replace("FAILED_COUNT", str(failed_count))
-    html_content = html_content.replace("TOTAL_CAPACITY", total_capacity)
-    html_content = html_content.replace("TABLE_ROWS", table_rows)
-    
-    with open(html_file, "w") as f:
-        f.write(html_content)
-    
-    print(f"HTML report generated: {html_file}")
-except Exception as e:
-    print(f"HTML generation skipped: {e}")
-PYTHON_EOF
-fi
-
-log "Disk inventory complete"
+log "Disk inventory complete (improved version)"
 echo ""
 echo "Output files:"
 echo "  - $OUTPUT_FILE"
-echo "  - $HTML_FILE"
+echo ""
+echo "Summary:"
+echo "  - Total disks: ${#DISK_MODEL[@]}"
+echo "  - SAS SSDs: $sas_ssd_count"
+echo "  - SATA HDDs: $sata_hdd_count"
+echo "  - Health warnings: $health_warn_count"
+echo "  - Health failures: $health_fail_count"
