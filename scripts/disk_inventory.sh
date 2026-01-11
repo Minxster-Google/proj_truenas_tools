@@ -32,6 +32,8 @@ declare -A DEVICE_SERIAL_MAP  # Maps serial -> /dev/sdX
 declare -A DISK_TEMPERATURE
 declare -A DISK_HEALTH
 declare -A DISK_ZPOOL_STATUS
+declare -A DISK_WEAR_PERCENT  # SSD wear level
+declare -A DISK_POWER_ON_HOURS  # Power on time
 
 ENCLOSURE_MAX_SLOT=25
 
@@ -141,7 +143,7 @@ get_smart_data() {
     
     debug "Getting SMART data for $dev (serial: $serial)"
     
-    # Get SMART data in one call for efficiency
+    # Get basic SMART data (fast)
     local smart_output=$(smartctl -AH "$dev" 2>/dev/null)
     
     # Extract temperature - TRY MULTIPLE METHODS
@@ -210,6 +212,62 @@ get_smart_data() {
     
     DISK_HEALTH["$serial"]="$health"
     debug "SMART data: temp=$temp, health=$health"
+    
+    # Extract SSD wear level (for SSDs)
+    local wear=""
+    
+    # For SSDs, try to get wear indicator
+    # Check if it's an SSD by looking for SSD-specific attributes
+    if echo "$smart_output" | grep -qi "SSD\|Solid State"; then
+        # Get extended info only for SSDs (faster than doing it for all disks)
+        local ssd_extended=$(smartctl -x "$dev" 2>/dev/null)
+        wear=$(echo "$ssd_extended" | grep -i "Percentage used endurance indicator" | grep -oE '[0-9]+%' | head -1)
+        
+        if [ -z "$wear" ]; then
+            # Try power hours from extended output for SSDs
+            local ssd_power=$(echo "$ssd_extended" | grep -i "Accumulated power on time" | grep -oE '[0-9]+' | head -1)
+            if [ -n "$ssd_power" ]; then
+                DISK_POWER_ON_HOURS["$serial"]="$ssd_power"
+            fi
+        fi
+    fi
+    
+    # Try attribute-based wear indicators
+    if [ -z "$wear" ]; then
+        wear=$(echo "$smart_output" | grep -i "Percentage used endurance indicator" | grep -oE '[0-9]+%' | head -1)
+    fi
+    
+    if [ -z "$wear" ]; then
+        # Try attribute 177 (Wear Leveling Count)
+        wear=$(echo "$smart_output" | grep "^177 " | awk '{print $10}')
+        if [ -n "$wear" ] && [ "$wear" != "0" ]; then
+            wear="${wear}%"
+        else
+            wear=""
+        fi
+    fi
+    
+    if [ -z "$wear" ]; then
+        # Try attribute 233 (Media Wearout Indicator) - higher is better
+        local media_wear=$(echo "$smart_output" | grep "^233 " | awk '{print $4}')
+        if [ -n "$media_wear" ] && [ "$media_wear" != "0" ]; then
+            # Convert to wear percentage (100 - value)
+            local wear_pct=$((100 - media_wear))
+            wear="${wear_pct}%"
+        fi
+    fi
+    
+    DISK_WEAR_PERCENT["$serial"]="${wear:--}"
+    debug "SSD wear: $wear"
+    
+    # Extract power on hours
+    local power_hours=$(echo "$smart_output" | grep "^  9 Power_On_Hours" | awk '{print $10}')
+    if [ -z "$power_hours" ]; then
+        # Try alternative format (from -x output)
+        power_hours=$(echo "$smart_output" | grep -i "Accumulated power on time" | grep -oE '[0-9]+' | head -1)
+    fi
+    DISK_POWER_ON_HOURS["$serial"]="${power_hours:--}"
+    debug "Power on hours: $power_hours"
 }
 
 # Check ZPool status for each device
@@ -278,10 +336,10 @@ echo "Generated: $(date)"
 echo "=============================================="
 echo ""
 echo "ENCLOSURE #2 (Main Chassis) - 24 slots"
-echo "----------------------------------------------"
-printf "%-5s | %-12s | %-25s | %-10s | %-8s | %-15s | %-6s | %-12s | %s\n" \
-    "SLOT" "STATE" "MODEL" "SIZE" "TYPE" "SERIAL" "TEMP" "HEALTH" "NOTES"
-echo "----------------------------------------------"
+echo "-----------------------------------------------------------------------------------------"
+printf "%-4s | %-11s | %-20s | %-8s | %-8s | %-15s | %-5s | %-5s | %-6s | %-12s | %s\n" \
+    "SLOT" "STATE" "MODEL" "SIZE" "TYPE" "SERIAL" "TEMP" "WEAR" "POH" "HEALTH" "NOTES"
+echo "-----------------------------------------------------------------------------------------"
 
 sas_ssd_count=0
 sata_hdd_count=0
@@ -302,10 +360,20 @@ for slot in $(seq 0 $((ENCLOSURE_MAX_SLOT - 1))); do
         dtype="${DISK_TYPE[$key]:-N/A}"
         serial="${DISK_SERIAL[$key]:-N/A}"
         
-        # Get temperature and health from cached data
+        # Get temperature, health, wear, and power-on hours from cached data
         temp="${DISK_TEMPERATURE[$serial]:-"-"}"
         health="${DISK_HEALTH[$serial]:-"UNKNOWN"}"
         zpool_status="${DISK_ZPOOL_STATUS[$serial]:-"NOT_IN_POOL"}"
+        wear="${DISK_WEAR_PERCENT[$serial]:-"-"}"
+        power_hours="${DISK_POWER_ON_HOURS[$serial]:-"-"}"
+        
+        # Convert power hours to days for display
+        if [ "$power_hours" != "-" ] && [ "$power_hours" -gt 0 ]; then
+            power_days=$((power_hours / 24))
+            power_display="${power_days}d"
+        else
+            power_display="-"
+        fi
 
         notes=""
         if [[ "$state" == *"Failed"* ]]; then
@@ -340,11 +408,11 @@ for slot in $(seq 0 $((ENCLOSURE_MAX_SLOT - 1))); do
             sata_hdd_capacity=$((sata_hdd_capacity + size_mb))
         fi
 
-        printf "%-5s | %-12s | %-25s | %-10s | %-8s | %-15s | %-6s | %-12s | %s\n" \
-            "$slot" "$state" "${model:0:25}" "$size" "$dtype" "${serial:0:15}" "${temp}°C" "$health" "$notes"
+        printf "%-4s | %-11s | %-20s | %-8s | %-8s | %-15s | %-5s | %-5s | %-6s | %-12s | %s\n" \
+            "$slot" "$state" "${model:0:20}" "$size" "$dtype" "${serial:0:15}" "${temp}°C" "$wear" "$power_display" "$health" "$notes"
     else
-        printf "%-5s | %-12s | %-25s | %-10s | %-8s | %-15s | %-6s | %-12s | %s\n" \
-            "$slot" "Empty" "(no disk detected)" "-" "-" "-" "-" "-" "-"
+        printf "%-4s | %-11s | %-20s | %-8s | %-8s | %-15s | %-5s | %-5s | %-6s | %-12s | %s\n" \
+            "$slot" "Empty" "(no disk detected)" "-" "-" "-" "-" "-" "-" "-" "-"
     fi
 done
 
