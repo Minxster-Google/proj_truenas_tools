@@ -1,22 +1,9 @@
 #!/bin/bash
-# TrueNAS Disk Inventory Script - IMPROVED VERSION
-# Generates a table of all disks with enclosure/slot info, SMART status, and health
-# Improvements:
-# - Fixed Drive Type parsing
-# - Serial number-based device mapping
-# - SMART health status checking
-# - ZPool status cross-reference
-
-OUTPUT_FILE="/mnt/RaidZ3/local_TrueNAS_scripts/HDD_Info/disk_inventory_$(date +%Y%m%d_%H%M%S).txt"
-HTML_FILE="/mnt/RaidZ3/local_TrueNAS_scripts/HDD_Info/disk_inventory_$(date +%Y%m%d_%H%M%S).html"
-LOG_FILE="/mnt/RaidZ3/local_TrueNAS_scripts/HDD_Info/disk_inventory.log"
+# TrueNAS Disk Inventory Script
+# Displays disk inventory with enclosure/slot info, temperatures, and SMART health
 
 # Enable debug mode by setting DEBUG=1
 DEBUG=${DEBUG:-0}
-
-log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
-}
 
 debug() {
     if [ "$DEBUG" = "1" ]; then
@@ -24,12 +11,12 @@ debug() {
     fi
 }
 
-log "Starting disk inventory (improved version)..."
+echo "Starting disk inventory scan..."
 
 # Get sas3ircu output
 SAS3IRCU_OUTPUT=$(sas3ircu 0 display 2>/dev/null)
 if [ $? -ne 0 ]; then
-    log "ERROR: sas3ircu 0 display failed"
+    echo "ERROR: sas3ircu 0 display failed"
     exit 1
 fi
 
@@ -89,6 +76,14 @@ parse_sas3ircu() {
                     serial=$(echo "$line_trimmed" | cut -d: -f2- | sed 's/^[[:space:]]*//' | tr -d ' ')
                     DISK_SERIAL["${enclosure}:${slot}"]="${serial:0:20}"
                     ;;
+                Unit\ Serial\ No*)
+                    # Use VPD serial (more reliable than "Serial No")
+                    vpd_serial=$(echo "$line_trimmed" | cut -d: -f2- | sed 's/^[[:space:]]*//' | tr -d ' ')
+                    if [ -n "$vpd_serial" ] && [ "$vpd_serial" != "N/A" ]; then
+                        DISK_SERIAL["${enclosure}:${slot}"]="${vpd_serial:0:20}"
+                        debug "Using VPD serial: $vpd_serial for slot $slot"
+                    fi
+                    ;;
                 Firmware\ Revision*)
                     fw=$(echo "$line_trimmed" | cut -d: -f2- | sed 's/^[[:space:]]*//' | tr -d ' ')
                     DISK_FW_REV["${enclosure}:${slot}"]="$fw"
@@ -97,8 +92,7 @@ parse_sas3ircu() {
                     # Don't exit yet - Drive Type comes after GUID
                     ;;
                 "Drive Type"*)
-                    # FIXED: Use quoted pattern to match "Drive Type" correctly
-                    # This comes AFTER GUID in the output, so we process it but then exit
+                    # This comes AFTER GUID in the output
                     dtype=$(echo "$line_trimmed" | cut -d: -f2 | sed 's/^[[:space:]]*//' | tr -d ' ')
                     DISK_TYPE["${enclosure}:${slot}"]="$dtype"
                     debug "Found Drive Type: $dtype for slot $slot"
@@ -111,16 +105,8 @@ parse_sas3ircu() {
 
 # Build serial number to device map
 build_device_serial_map() {
-    log "Building device-to-serial map (this may take 30-60 seconds)..."
+    echo -n "Mapping devices to serial numbers... "
     local count=0
-    local total=0
-    
-    # Count total devices first
-    for dev in /dev/sd*; do
-        [[ "$dev" =~ [0-9]$ ]] && continue
-        [ -b "$dev" ] || continue
-        ((total++))
-    done
     
     for dev in /dev/sd*; do
         # Skip partitions (only whole disks)
@@ -129,22 +115,19 @@ build_device_serial_map() {
         # Check if block device exists
         [ -b "$dev" ] || continue
         
-        ((count++))
-        echo -ne "\rScanning devices: $count/$total..." >&2
-        
         # Get serial from smartctl
         serial=$(smartctl -i "$dev" 2>/dev/null | grep -i "serial number" | awk '{print $NF}' | tr -d ' ')
         
         if [ -n "$serial" ]; then
             DEVICE_SERIAL_MAP["$serial"]="$dev"
+            ((count++))
             debug "Mapped serial $serial -> $dev"
         fi
     done
-    echo -e "\rFound ${#DEVICE_SERIAL_MAP[@]} devices with serial numbers      " >&2
-    log "Device mapping complete: ${#DEVICE_SERIAL_MAP[@]} devices"
+    echo "found $count devices"
 }
 
-# Get temperature and health using serial number
+# Get temperature and health using serial number - IMPROVED
 get_smart_data() {
     local serial="$1"
     local dev="${DEVICE_SERIAL_MAP[$serial]:-}"
@@ -161,12 +144,42 @@ get_smart_data() {
     # Get SMART data in one call for efficiency
     local smart_output=$(smartctl -AH "$dev" 2>/dev/null)
     
-    # Extract temperature
-    local temp=$(echo "$smart_output" | grep -iE "temperature|airflow" | head -1 | awk '{print $10}')
+    # Extract temperature - TRY MULTIPLE METHODS
+    local temp=""
+    
+    # Method 1: "Current Drive Temperature:" format (used by many SSDs and some WD drives)
+    temp=$(echo "$smart_output" | grep -i "Current Drive Temperature" | awk '{print $4}')
+    debug "Method 1 (Current Drive Temp): temp='$temp'"
+    
+    # Method 2: Attribute 194 (Temperature_Celsius) - most common
+    if [ -z "$temp" ] || [ "$temp" == "0" ]; then
+        temp=$(echo "$smart_output" | grep "^194 " | awk '{print $10}')
+        debug "Method 2 (194): temp='$temp'"
+    fi
+    
+    # Method 3: Attribute 190 (Airflow_Temperature)
+    if [ -z "$temp" ] || [ "$temp" == "0" ]; then
+        temp=$(echo "$smart_output" | grep "^190 " | awk '{print $10}')
+        debug "Method 3 (190): temp='$temp'"
+    fi
+    
+    # Method 4: Any line with temperature
+    if [ -z "$temp" ] || [ "$temp" == "0" ]; then
+        temp=$(echo "$smart_output" | grep -i "temperature" | grep -v "Drive Trip" | head -1 | awk '{print $NF}')
+        debug "Method 4 (generic): temp='$temp'"
+    fi
+    
+    # Clean up temp value (remove non-numeric except dash)
+    if [ -n "$temp" ] && [ "$temp" != "0" ] && [ "$temp" != "-" ]; then
+        # Extract just the number
+        temp=$(echo "$temp" | grep -oE '[0-9]+' | head -1)
+    fi
+    
     if [ -z "$temp" ] || [ "$temp" == "0" ]; then
         temp="-"
     fi
     DISK_TEMPERATURE["$serial"]="$temp"
+    debug "Final temp for serial $serial: $temp"
     
     # Extract health status
     local health=$(echo "$smart_output" | grep -i "SMART overall-health" | awk '{print $NF}')
@@ -201,8 +214,9 @@ get_smart_data() {
 
 # Check ZPool status for each device
 check_zpool_status() {
-    log "Checking ZPool status..."
+    echo -n "Checking ZPool status... "
     local zpool_output=$(zpool status 2>/dev/null)
+    local count=0
     
     for serial in "${!DEVICE_SERIAL_MAP[@]}"; do
         local dev="${DEVICE_SERIAL_MAP[$serial]}"
@@ -212,6 +226,7 @@ check_zpool_status() {
         if echo "$zpool_output" | grep -q "$dev_basename"; then
             if echo "$zpool_output" | grep "$dev_basename" | grep -qi "DEGRADED\|FAULTED\|UNAVAIL"; then
                 DISK_ZPOOL_STATUS["$serial"]="ISSUE"
+                ((count++))
                 debug "ZPool issue detected for $dev_basename"
             elif echo "$zpool_output" | grep "$dev_basename" | grep -qi "ONLINE"; then
                 DISK_ZPOOL_STATUS["$serial"]="ONLINE"
@@ -222,7 +237,7 @@ check_zpool_status() {
             DISK_ZPOOL_STATUS["$serial"]="NOT_IN_POOL"
         fi
     done
-    log "ZPool status check complete"
+    echo "done"
 }
 
 format_size_mb() {
@@ -238,12 +253,12 @@ format_size_mb() {
 
 # Main execution
 parse_sas3ircu
-log "Found ${#DISK_MODEL[@]} disks in sas3ircu output"
+echo "Found ${#DISK_MODEL[@]} disks in enclosure"
 
 build_device_serial_map
 
 # Get SMART data for all disks
-log "Collecting SMART data for all disks..."
+echo -n "Collecting SMART data... "
 for slot in $(seq 0 $((ENCLOSURE_MAX_SLOT - 1))); do
     key="2:${slot}"
     if [ -n "${DISK_SERIAL[$key]:-}" ]; then
@@ -251,159 +266,111 @@ for slot in $(seq 0 $((ENCLOSURE_MAX_SLOT - 1))); do
         get_smart_data "$serial"
     fi
 done
+echo "done"
 
 check_zpool_status
 
 # Generate report
-{
-    echo "=============================================="
-    echo "TrueNAS Disk Inventory Report (IMPROVED)"
-    echo "Generated: $(date)"
-    echo "=============================================="
-    echo ""
-    echo "ENCLOSURE #2 (Main Chassis) - ${ENCLOSURE_MAX_SLOT} slots total"
-    echo "----------------------------------------------"
-    printf "%-5s | %-12s | %-25s | %-10s | %-8s | %-15s | %-6s | %-12s | %s\n" \
-        "SLOT" "STATE" "MODEL" "SIZE" "TYPE" "SERIAL" "TEMP" "HEALTH" "NOTES"
-    echo "----------------------------------------------"
+echo ""
+echo "=============================================="
+echo "TrueNAS Disk Inventory Report"
+echo "Generated: $(date)"
+echo "=============================================="
+echo ""
+echo "ENCLOSURE #2 (Main Chassis) - 24 slots"
+echo "----------------------------------------------"
+printf "%-5s | %-12s | %-25s | %-10s | %-8s | %-15s | %-6s | %-12s | %s\n" \
+    "SLOT" "STATE" "MODEL" "SIZE" "TYPE" "SERIAL" "TEMP" "HEALTH" "NOTES"
+echo "----------------------------------------------"
 
-    sas_ssd_count=0
-    sata_hdd_count=0
-    sas_ssd_capacity=0
-    sata_hdd_capacity=0
-    health_warn_count=0
-    health_fail_count=0
+sas_ssd_count=0
+sata_hdd_count=0
+sas_ssd_capacity=0
+sata_hdd_capacity=0
+health_warn_count=0
+health_fail_count=0
+failed_disks_details=""
 
-    for slot in $(seq 0 $((ENCLOSURE_MAX_SLOT - 1))); do
-        key="2:${slot}"
+for slot in $(seq 0 $((ENCLOSURE_MAX_SLOT - 1))); do
+    key="2:${slot}"
 
-        if [ -n "${DISK_MODEL[$key]:-}" ]; then
-            state="${DISK_STATE[$key]:-N/A}"
-            model="${DISK_MODEL[$key]:-N/A}"
-            size_mb=${DISK_SIZE_MB[$key]:-0}
-            size=$(format_size_mb $size_mb)
-            dtype="${DISK_TYPE[$key]:-N/A}"
-            serial="${DISK_SERIAL[$key]:-N/A}"
-            
-            # Get temperature and health from cached data
-            temp="${DISK_TEMPERATURE[$serial]:-"-"}"
-            health="${DISK_HEALTH[$serial]:-"UNKNOWN"}"
-            zpool_status="${DISK_ZPOOL_STATUS[$serial]:-"NOT_IN_POOL"}"
+    if [ -n "${DISK_MODEL[$key]:-}" ]; then
+        state="${DISK_STATE[$key]:-N/A}"
+        model="${DISK_MODEL[$key]:-N/A}"
+        size_mb=${DISK_SIZE_MB[$key]:-0}
+        size=$(format_size_mb $size_mb)
+        dtype="${DISK_TYPE[$key]:-N/A}"
+        serial="${DISK_SERIAL[$key]:-N/A}"
+        
+        # Get temperature and health from cached data
+        temp="${DISK_TEMPERATURE[$serial]:-"-"}"
+        health="${DISK_HEALTH[$serial]:-"UNKNOWN"}"
+        zpool_status="${DISK_ZPOOL_STATUS[$serial]:-"NOT_IN_POOL"}"
 
-            notes=""
-            if [[ "$state" == *"Failed"* ]]; then
-                notes="FAILED"
-            elif [[ "$state" == *"Standby"* ]]; then
-                notes="SPIN DOWN"
-            fi
-            
-            # Add ZPool status to notes if there's an issue
-            if [[ "$zpool_status" == "ISSUE" ]]; then
-                notes="${notes:+$notes, }ZPOOL_ISSUE"
-            fi
-            
-            # Count health warnings/failures
-            if [[ "$health" == "WARN"* ]]; then
-                ((health_warn_count++))
-            elif [[ "$health" == "FAILED" ]]; then
-                ((health_fail_count++))
-            fi
-
-            if [[ "$dtype" == "SAS_SSD" ]]; then
-                dtype="SAS-SSD"
-                sas_ssd_count=$((sas_ssd_count + 1))
-                sas_ssd_capacity=$((sas_ssd_capacity + size_mb))
-            elif [[ "$dtype" == "SATA_HDD" ]]; then
-                dtype="SATA-HDD"
-                sata_hdd_count=$((sata_hdd_count + 1))
-                sata_hdd_capacity=$((sata_hdd_capacity + size_mb))
-            fi
-
-            printf "%-5s | %-12s | %-25s | %-10s | %-8s | %-15s | %-6s | %-12s | %s\n" \
-                "$slot" "$state" "${model:0:25}" "$size" "$dtype" "${serial:0:15}" "${temp}°C" "$health" "$notes"
-        else
-            printf "%-5s | %-12s | %-25s | %-10s | %-8s | %-15s | %-6s | %-12s | %s\n" \
-                "$slot" "Empty" "(no disk detected)" "-" "-" "-" "-" "-" "-"
+        notes=""
+        if [[ "$state" == *"Failed"* ]]; then
+            notes="FAILED"
+        elif [[ "$state" == *"Standby"* ]]; then
+            notes="SPIN DOWN"
         fi
-    done
-
-    echo ""
-    echo "----------------------------------------------"
-    echo "ENCLOSURE SERVICES (Slot 24)"
-    echo "----------------------------------------------"
-    echo "Slot 24: Enclosure services device (GOOXIBM 4U24SXP)"
-    echo ""
-    echo "----------------------------------------------"
-    echo "DISK SUMMARY BY TYPE"
-    echo "----------------------------------------------"
-    echo "SAS SSDs: $sas_ssd_count disks ($(format_size_mb $sas_ssd_capacity) total)"
-    echo "SATA HDDs: $sata_hdd_count disks ($(format_size_mb $sata_hdd_capacity) total)"
-    total_capacity=$((sas_ssd_capacity + sata_hdd_capacity))
-    echo "Total Storage: $(format_size_mb $total_capacity)"
-    echo ""
-    echo "----------------------------------------------"
-    echo "HEALTH SUMMARY"
-    echo "----------------------------------------------"
-    echo "Disks with warnings: $health_warn_count"
-    echo "Disks with failures: $health_fail_count"
-    echo ""
-    echo "----------------------------------------------"
-    echo "POTENTIAL FAILED/MISSING DISKS"
-    echo "----------------------------------------------"
-
-    failed_count=0
-    for slot in $(seq 0 $((ENCLOSURE_MAX_SLOT - 1))); do
-        key="2:${slot}"
-        if [ -n "${DISK_STATE[$key]:-}" ]; then
-            state="${DISK_STATE[$key]}"
-            serial="${DISK_SERIAL[$key]}"
-            health="${DISK_HEALTH[$serial]:-UNKNOWN}"
-            zpool_status="${DISK_ZPOOL_STATUS[$serial]:-NOT_IN_POOL}"
-            
-            if [[ "$state" == *"Failed"* ]] || [[ "$health" == "FAILED" ]] || [[ "$zpool_status" == "ISSUE" ]]; then
-                echo "Slot $slot: ${DISK_MODEL[$key]:-Unknown} - State: $state, Health: $health, ZPool: $zpool_status"
-                failed_count=$((failed_count + 1))
-            fi
+        
+        # Add ZPool status to notes if there's an issue
+        if [[ "$zpool_status" == "ISSUE" ]]; then
+            notes="${notes:+$notes, }ZPOOL_ISSUE"
         fi
-    done
+        
+        # Count health warnings/failures and track failed disks
+        if [[ "$health" == "WARN"* ]]; then
+            ((health_warn_count++))
+        elif [[ "$health" == "FAILED" ]]; then
+            ((health_fail_count++))
+        fi
+        
+        if [[ "$state" == *"Failed"* ]] || [[ "$health" == "FAILED" ]] || [[ "$zpool_status" == "ISSUE" ]]; then
+            failed_disks_details+="Slot $slot: $model - State: $state, Health: $health, ZPool: $zpool_status"$'\n'
+        fi
 
-    if [ $failed_count -eq 0 ]; then
-        echo "No failed disks detected"
+        if [[ "$dtype" == "SAS_SSD" ]]; then
+            dtype="SAS-SSD"
+            sas_ssd_count=$((sas_ssd_count + 1))
+            sas_ssd_capacity=$((sas_ssd_capacity + size_mb))
+        elif [[ "$dtype" == "SATA_HDD" ]]; then
+            dtype="SATA-HDD"
+            sata_hdd_count=$((sata_hdd_count + 1))
+            sata_hdd_capacity=$((sata_hdd_capacity + size_mb))
+        fi
+
+        printf "%-5s | %-12s | %-25s | %-10s | %-8s | %-15s | %-6s | %-12s | %s\n" \
+            "$slot" "$state" "${model:0:25}" "$size" "$dtype" "${serial:0:15}" "${temp}°C" "$health" "$notes"
+    else
+        printf "%-5s | %-12s | %-25s | %-10s | %-8s | %-15s | %-6s | %-12s | %s\n" \
+            "$slot" "Empty" "(no disk detected)" "-" "-" "-" "-" "-" "-"
     fi
+done
 
-    echo ""
-    echo "----------------------------------------------"
-    echo "DETECTION METHODS USED"
-    echo "----------------------------------------------"
-    echo "1. sas3ircu 0 display - Primary source for enclosure/slot mapping"
-    echo "2. Serial number matching - Correlates physical slots to /dev/sdX devices"
-    echo "3. smartctl - Temperature and SMART health data"
-    echo "4. zpool status - Pool-level disk status"
-    echo ""
-    echo "IMPROVEMENTS IN THIS VERSION:"
-    echo "- Fixed Drive Type parsing (now correctly detects SAS_SSD, SATA_HDD)"
-    echo "- Serial number-based device mapping (more reliable than lsscsi slot order)"
-    echo "- SMART health status with critical attribute checking"
-    echo "- ZPool status cross-reference"
-    echo ""
-    echo "Note: Failed disks may not appear in sas3ircu output"
-    echo "Check zpool status for complete pool health information"
-    echo ""
-    echo "=============================================="
-    echo "End of Report"
-    echo "=============================================="
-
-} | tee "$OUTPUT_FILE"
-
-log "Inventory saved to $OUTPUT_FILE"
-log "Disk inventory complete (improved version)"
 echo ""
-echo "Output files:"
-echo "  - $OUTPUT_FILE"
+echo "----------------------------------------------"
+echo "DISK SUMMARY BY TYPE"
+echo "----------------------------------------------"
+echo "SAS SSDs: $sas_ssd_count disks ($(format_size_mb $sas_ssd_capacity) total)"
+echo "SATA HDDs: $sata_hdd_count disks ($(format_size_mb $sata_hdd_capacity) total)"
+total_capacity=$((sas_ssd_capacity + sata_hdd_capacity))
+echo "Total Storage: $(format_size_mb $total_capacity)"
 echo ""
-echo "Summary:"
-echo "  - Total disks: ${#DISK_MODEL[@]}"
-echo "  - SAS SSDs: $sas_ssd_count"
-echo "  - SATA HDDs: $sata_hdd_count"
-echo "  - Health warnings: $health_warn_count"
-echo "  - Health failures: $health_fail_count"
+echo "----------------------------------------------"
+echo "HEALTH SUMMARY"
+echo "----------------------------------------------"
+echo "Disks with warnings: $health_warn_count"
+echo "Disks with failures: $health_fail_count"
+echo ""
+echo "----------------------------------------------"
+echo "POTENTIAL FAILED/MISSING DISKS"
+echo "----------------------------------------------"
+
+if [ -n "$failed_disks_details" ]; then
+    echo "$failed_disks_details"
+else
+    echo "No failed disks detected"
+fi
+
+echo "=============================================="
